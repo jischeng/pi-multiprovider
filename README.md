@@ -6,6 +6,8 @@
 
 _One provider ID. One model ID. As many API-key or OAuth accounts as you need._
 
+_Published as `@jischeng/pi-multiprovider` — a fork of [monotykamary/pi-multiprovider](https://github.com/monotykamary/pi-multiprovider)._
+
 <p>
   <img src="https://raw.githubusercontent.com/monotykamary/pi-multiprovider/main/media/cover.svg" alt="Animated abstract artwork: violet, indigo, cyan, and teal credential streams converge into a glowing scheduler nexus and leave as one luminous current — one stream briefly flares and cools down while the rest carry the load" width="1100">
 </p>
@@ -43,14 +45,14 @@ If an account fails before visible output, the lift can cool it down and retry a
 Requires Node.js 22.19+ and Pi 0.84.3+.
 
 ```bash
-pi install npm:pi-multiprovider
+pi install npm:@jischeng/pi-multiprovider
 ```
 
 The npm package registers the extension automatically. Install the provider extension you want to pool as usual; for example:
 
 ```bash
 pi install npm:pi-zro-provider
-pi install npm:pi-multiprovider
+pi install npm:@jischeng/pi-multiprovider
 ```
 
 <details>
@@ -59,7 +61,7 @@ pi install npm:pi-multiprovider
 From the new GitHub repository:
 
 ```bash
-pi install git:github.com/monotykamary/pi-multiprovider
+pi install git:github.com/jischeng/pi-multiprovider
 ```
 
 From a local checkout:
