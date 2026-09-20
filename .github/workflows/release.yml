@@ -50,10 +50,20 @@ jobs:
       - name: Checks
         run: bun run check
 
-      # Publishes via Trusted Publishing (OIDC) — no NPM_TOKEN needed.
-      # Until a trusted publisher is configured for this package on npmjs.com,
-      # set NPM_TOKEN (automation token) and this step will use it instead.
-      - name: Publish to npm
+      # Publishes via Trusted Publishing (OIDC) when no token is provided.
+      # A brand-new package cannot use trusted publishing until it exists, so a
+      # first release can be published with an `NPM_TOKEN` repository secret;
+      # remove that secret afterwards to go back to OIDC.
+      - name: Detect npm token
+        id: npm-token
+        run: echo "available=${{ secrets.NPM_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm (trusted publishing)
+        if: steps.npm-token.outputs.available != 'true'
+        run: npm publish --provenance --access public
+
+      - name: Publish to npm (token)
+        if: steps.npm-token.outputs.available == 'true'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
