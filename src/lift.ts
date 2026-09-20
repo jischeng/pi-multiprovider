@@ -148,6 +148,7 @@ function liftedStream<TApi extends Api, TCredentialRef>(
             providerId: provider.id,
             ...(affinityKey === undefined ? {} : { affinityKey }),
             excludeAccountIds: attempted,
+            modelId: model.id,
           })
         } catch (error) {
           if (lastRejected !== undefined) {
