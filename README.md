@@ -123,6 +123,14 @@ Session affinity can pin a healthy account to the current Pi session. Explicit r
 
 A rejected account is not abandoned on the first error. Each stream absorbs up to `errorsBeforeSwitch` (default **3**, configurable in the `/multilogin` Scheduler panel) pre-output errors on the same account—separated by a short pause—before releasing the lease, applying the failure cooldown, and moving to the next account. Errors after output has started and non-retryable failures surface immediately, exactly as before.
 
+**Entitlement failures are the exception.** When a provider reports that the account's plan does not cover the requested model (Qoder answers `403 code 112` with a pricing link, other providers phrase it as plan/upgrade/not-entitled), the account is not unhealthy—only that model is out of reach. Such a failure is classified as `kind: 'entitlement'` with `scope: 'model'`, which means:
+
+- it skips the same-account tolerance (no retry on an account that cannot serve the model) and switches accounts immediately;
+- it does **not** count as an account health failure and never cools the whole credential down;
+- the cooldown is recorded against the (model, account) pair for `entitlementCooldownMs` (default **30m**, configurable in the `/multilogin` Scheduler panel) through the same cooldown machinery as every other failure kind, so `/accounts` and the snapshot expose it as a per-model cooldown;
+- later requests for that model go straight to an account that can run it, while every other model keeps using the account normally;
+- the cooldown is lifted by a successful call for the pair, expires on its own, and is only ever an optimisation: when every account is cooling for a model the scheduler falls back to the normal health-based selection instead of dead-ending.
+
 When [pi-fabric](https://github.com/monotykamary/pi-fabric) is installed, failing over to a different account first compacts the session with fabric's deterministic, LLM-free compaction engine. The failing request surfaces its error, the session compacts while the retry backoff runs, and the retry lands on the next account with a small context instead of a huge cold prefill. This is the default behavior; without fabric installed, streams rotate accounts inline as before.
 
 ## Virtual providers
@@ -178,7 +186,7 @@ API-key credentials use the provider's native `resolve()` method, including prov
 
 When **Pi default** is enabled, the lifted auth method first lets Pi resolve its normal credential. Multiprovider marks only the names—not values—of credential-specific headers and environment fields. If a stored account is selected, stale upstream auth fields and credential-specific base URLs are removed before transport.
 
-Inside `/multilogin` the **Pi default** credential appears in the pool's account list like any stored account: relabel it, raise or lower its weight (default 1) and priority (default 0), or disable it so only multilogin accounts run. When no pool exists yet but `/login` already has a credential configured, it is listed as pending so it can be preconfigured before the first stored account. The credential value itself stays Pi-owned—rotate or replace it through `/login`. Pool, account, upstream, and scheduler settings persist alongside the credentials in `multiprovider-auth.json`. The manager's **Scheduler** section overrides the global failure cooldowns live: rate limit (60s), quota (15m), auth (5m), transient base (1s, doubling per consecutive failure), and the 60m cap.
+Inside `/multilogin` the **Pi default** credential appears in the pool's account list like any stored account: relabel it, raise or lower its weight (default 1) and priority (default 0), or disable it so only multilogin accounts run. When no pool exists yet but `/login` already has a credential configured, it is listed as pending so it can be preconfigured before the first stored account. The credential value itself stays Pi-owned—rotate or replace it through `/login`. Pool, account, upstream, and scheduler settings persist alongside the credentials in `multiprovider-auth.json`. The manager's **Scheduler** section overrides the global failure cooldowns live: rate limit (60s), quota (15m), auth (5m), entitlement (30m, per model), transient base (1s, doubling per consecutive failure), and the 60m cap.
 
 ## Failover semantics
 

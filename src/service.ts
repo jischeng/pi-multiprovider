@@ -49,6 +49,7 @@ const DEFAULTS = {
   rateLimitCooldownMs: 60_000,
   quotaCooldownMs: 15 * 60_000,
   authCooldownMs: 5 * 60_000,
+  entitlementCooldownMs: 30 * 60_000,
   transientBaseCooldownMs: 1_000,
   maxCooldownMs: 60 * 60_000,
   errorsBeforeSwitch: 3,
@@ -58,6 +59,7 @@ export const SCHEDULER_DEFAULTS: Required<SchedulerSettings> = {
   rateLimitCooldownMs: DEFAULTS.rateLimitCooldownMs,
   quotaCooldownMs: DEFAULTS.quotaCooldownMs,
   authCooldownMs: DEFAULTS.authCooldownMs,
+  entitlementCooldownMs: DEFAULTS.entitlementCooldownMs,
   transientBaseCooldownMs: DEFAULTS.transientBaseCooldownMs,
   maxCooldownMs: DEFAULTS.maxCooldownMs,
   errorsBeforeSwitch: DEFAULTS.errorsBeforeSwitch,
@@ -65,6 +67,15 @@ export const SCHEDULER_DEFAULTS: Required<SchedulerSettings> = {
 
 function stateKey(providerId: string, accountId: string): string {
   return JSON.stringify([providerId, accountId])
+}
+
+/** Key for one (provider, model) pair, used for entitlement marks. */
+function entitlementKey(providerId: string, modelId: string): string {
+  return JSON.stringify([providerId, modelId])
+}
+
+function entitlementKeyPrefix(providerId: string): string {
+  return `[${JSON.stringify(providerId)},`
 }
 
 function statusFromFailure(failure: ProviderAttemptFailure): number | undefined {
@@ -78,6 +89,17 @@ function statusFromFailure(failure: ProviderAttemptFailure): number | undefined 
 function defaultDisposition(failure: ProviderAttemptFailure): FailureDisposition {
   const message = failure.message.toLowerCase()
   const status = statusFromFailure(failure)
+  // A provider that answers "this account is not entitled to this model" is not
+  // an unhealthy account: only that (model, account) pair is unusable. Qoder
+  // reports it as 403 code 112 with a pricing link (after holding the request
+  // open for minutes), other providers phrase it as a plan/upgrade problem.
+  if (
+    /pricingurl|entitlement|not entitled|not authorized for (?:this|the) model|upgrade (?:your )?(?:plan|subscription)|plan (?:does not|doesn't|doesnt) (?:include|support)|code["'\s:=]*112\b/.test(
+      message,
+    )
+  ) {
+    return { kind: 'entitlement', retryable: true, scope: 'model' }
+  }
   if (status === 429 || /rate.?limit|too many requests|overloaded/.test(message)) {
     return { kind: 'rate-limit', retryable: true }
   }
@@ -102,6 +124,9 @@ export class MultiProviderService {
   private readonly explicitAffinity = new Map<string, Set<string>>()
   private readonly roundRobinCursor = new Map<string, number>()
   private readonly smoothScores = new Map<string, Map<string, number>>()
+  // (providerId, modelId) -> accountId -> cooldown end, for model-scoped
+  // cooldowns (entitlement rejections). Same lifetime rules as account cooldowns.
+  private readonly modelCooldowns = new Map<string, Map<string, number>>()
   private readonly defaults: Required<Omit<SchedulerOptions, 'now' | 'randomId' | 'randomInt'>>
   private readonly now: () => number
   private readonly randomId: () => string
@@ -117,6 +142,7 @@ export class MultiProviderService {
       transientBaseCooldownMs: options.transientBaseCooldownMs ?? DEFAULTS.transientBaseCooldownMs,
       maxCooldownMs: options.maxCooldownMs ?? DEFAULTS.maxCooldownMs,
       errorsBeforeSwitch: options.errorsBeforeSwitch ?? DEFAULTS.errorsBeforeSwitch,
+      entitlementCooldownMs: options.entitlementCooldownMs ?? DEFAULTS.entitlementCooldownMs,
     }
     this.now = options.now ?? Date.now
     this.randomId = options.randomId ?? randomUUID
@@ -138,6 +164,9 @@ export class MultiProviderService {
       this.explicitAffinity.delete(registration.id)
       this.roundRobinCursor.delete(registration.id)
       this.smoothScores.delete(registration.id)
+      for (const key of this.modelCooldowns.keys()) {
+        if (key.startsWith(entitlementKeyPrefix(registration.id))) this.modelCooldowns.delete(key)
+      }
     }
   }
 
@@ -157,9 +186,20 @@ export class MultiProviderService {
     const accounts = await this.effectiveAccounts(registration, pool)
     const excluded = new Set(options.excludeAccountIds ?? [])
     const now = this.now()
-    const available = accounts.filter(item =>
+    const healthy = accounts.filter(item =>
       item.enabled && item.runtime.cooldownUntil <= now && !excluded.has(item.account.id),
     )
+    // A model-scoped cooldown only rules an account out for that one model, and
+    // it is an optimisation, never a dead end: when it excludes every healthy
+    // account we fall back to the health-only view and let the request prove
+    // otherwise.
+    const modelCooling = options.modelId === undefined
+      ? undefined
+      : this.modelCooldownsFor(options.providerId, options.modelId, false)
+    const eligible = modelCooling === undefined
+      ? healthy
+      : healthy.filter(item => (modelCooling.get(item.account.id) ?? 0) <= now)
+    const available = eligible.length > 0 ? eligible : healthy
 
     if (available.length === 0) {
       const future = accounts
@@ -219,9 +259,9 @@ export class MultiProviderService {
         if (released) return undefined
         released = true
         selected.runtime.inFlight = Math.max(0, selected.runtime.inFlight - 1)
-        if (outcome.status === 'success') this.recordSuccess(options.providerId, account.id)
+        if (outcome.status === 'success') this.recordSuccess(options.providerId, account.id, options.modelId)
         else if (outcome.status === 'failure') {
-          return this.recordFailure(registration, account, outcome.error)
+          return this.recordFailure(registration, account, outcome.error, options.modelId)
         }
         return undefined
       },
@@ -236,21 +276,25 @@ export class MultiProviderService {
       const now = this.now()
       const accounts: PublicAccountSnapshot[] = effective.map(({
         account, enabled, weight, priority, runtime,
-      }) => ({
-        id: account.id,
-        label: account.label,
-        authKind: account.authKind,
-        enabled,
-        weight,
-        priority,
-        status: !enabled ? 'disabled' : runtime.cooldownUntil > now ? 'cooldown' : 'ready',
-        inFlight: runtime.inFlight,
-        consecutiveFailures: runtime.consecutiveFailures,
-        ...(runtime.cooldownUntil > now ? { cooldownUntil: runtime.cooldownUntil } : {}),
-        ...(runtime.lastSelectedAt === undefined ? {} : { lastSelectedAt: runtime.lastSelectedAt }),
-        ...(runtime.lastFailureKind === undefined ? {} : { lastFailureKind: runtime.lastFailureKind }),
-        metadata: account.metadata ?? {},
-      }))
+      }) => {
+        const modelCooldowns = this.activeModelCooldowns(registration.id, account.id)
+        return {
+          id: account.id,
+          label: account.label,
+          authKind: account.authKind,
+          enabled,
+          weight,
+          priority,
+          status: !enabled ? 'disabled' : runtime.cooldownUntil > now ? 'cooldown' : 'ready',
+          inFlight: runtime.inFlight,
+          consecutiveFailures: runtime.consecutiveFailures,
+          ...(runtime.cooldownUntil > now ? { cooldownUntil: runtime.cooldownUntil } : {}),
+          ...(modelCooldowns.length === 0 ? {} : { modelCooldowns }),
+          ...(runtime.lastSelectedAt === undefined ? {} : { lastSelectedAt: runtime.lastSelectedAt }),
+          ...(runtime.lastFailureKind === undefined ? {} : { lastFailureKind: runtime.lastFailureKind }),
+          metadata: account.metadata ?? {},
+        }
+      })
       providers.push({
         id: registration.id,
         label: registration.label,
@@ -310,10 +354,16 @@ export class MultiProviderService {
   resetHealth(providerId: string, accountId: string): void {
     this.registration(providerId)
     const runtime = this.runtime.get(stateKey(providerId, accountId))
-    if (runtime === undefined) return
-    runtime.consecutiveFailures = 0
-    runtime.cooldownUntil = 0
-    delete runtime.lastFailureKind
+    if (runtime !== undefined) {
+      runtime.consecutiveFailures = 0
+      runtime.cooldownUntil = 0
+      delete runtime.lastFailureKind
+    }
+    // Resetting an account clears every model-scoped cooldown it holds too.
+    for (const [key, entry] of this.modelCooldowns) {
+      entry.delete(accountId)
+      if (entry.size === 0) this.modelCooldowns.delete(key)
+    }
   }
 
   async pinAccount(providerId: string, affinityKey: string, accountId: string): Promise<void> {
@@ -395,8 +445,7 @@ export class MultiProviderService {
     return runtime
   }
 
-  private async effectiveAccounts(
-    registration: ProviderRegistration,
+  private async effectiveAccounts(    registration: ProviderRegistration,
     pool: PoolPreference,
   ): Promise<EffectiveAccount[]> {
     const inventory = [...await registration.accounts()]
@@ -490,26 +539,100 @@ export class MultiProviderService {
     return selected
   }
 
-  private recordSuccess(providerId: string, accountId: string): void {
+  private recordSuccess(providerId: string, accountId: string, modelId?: string): void {
     const runtime = this.runtimeFor(providerId, accountId)
     runtime.consecutiveFailures = 0
     runtime.cooldownUntil = 0
     delete runtime.lastFailureKind
+    // A successful call proves the pair works, so lift its model cooldown.
+    if (modelId !== undefined) {
+      this.modelCooldownsFor(providerId, modelId, false)?.delete(accountId)
+    }
+  }
+
+  /** Lift the cooldown table for one (provider, model) pair, pruning expired entries. */
+  private modelCooldownsFor(
+    providerId: string,
+    modelId: string,
+    create = true,
+  ): Map<string, number> | undefined {
+    const key = entitlementKey(providerId, modelId)
+    const existing = this.modelCooldowns.get(key)
+    if (existing !== undefined) {
+      const now = this.now()
+      for (const [accountId, until] of existing) if (until <= now) existing.delete(accountId)
+      if (existing.size > 0) return existing
+      this.modelCooldowns.delete(key)
+    }
+    if (!create) return undefined
+    const created = new Map<string, number>()
+    this.modelCooldowns.set(key, created)
+    return created
+  }
+
+  /** Per-model cooldowns still in force for an account, newest first. */
+  private activeModelCooldowns(providerId: string, accountId: string): Array<{ modelId: string; until: number }> {
+    const now = this.now()
+    const result: Array<{ modelId: string; until: number }> = []
+    for (const [key, entry] of this.modelCooldowns) {
+      const until = entry.get(accountId)
+      if (until === undefined || until <= now) continue
+      const [, modelId] = JSON.parse(key) as [string, string]
+      result.push({ modelId, until })
+    }
+    return result.sort((left, right) => right.until - left.until)
+  }
+
+  /**
+   * Classify a failure the way the scheduler will, applying the provider's own
+   * `classifyFailure` override when it has one. Exposed so stream adapters can
+   * react before a lease is released (e.g. skip same-account retries for an
+   * entitlement error, which no retry on this account can fix).
+   */
+  classifyFailure(
+    providerId: string,
+    account: ProviderAccount,
+    failure: ProviderAttemptFailure,
+  ): FailureDisposition {
+    const registration = this.providers.get(providerId)
+    if (registration === undefined) return defaultDisposition(failure)
+    return this.classify(registration, account, failure)
+  }
+
+  private classify(
+    registration: ProviderRegistration,
+    account: ProviderAccount,
+    failure: ProviderAttemptFailure,
+  ): FailureDisposition {
+    try {
+      return registration.classifyFailure?.(failure, account)
+        ?? defaultDisposition(failure)
+    } catch {
+      return { kind: 'fatal', retryable: false }
+    }
   }
 
   private recordFailure(
     registration: ProviderRegistration,
     account: ProviderAccount,
     failure: ProviderAttemptFailure,
+    modelId?: string,
   ): FailureDisposition {
-    let disposition: FailureDisposition
-    try {
-      disposition = registration.classifyFailure?.(failure, account)
-        ?? defaultDisposition(failure)
-    } catch {
-      disposition = { kind: 'fatal', retryable: false }
-    }
+    const disposition = this.classify(registration, account, failure)
     const runtime = this.runtimeFor(registration.id, account.id)
+    // Model-scoped cooldowns need the model they apply to; without one the
+    // failure degrades to the account, so a rejection is never silently lost.
+    if (disposition.scope === 'model' && modelId !== undefined) {
+      // The account itself is healthy; only this model is out of reach. Show it
+      // in the snapshot, but do not count it as account health or cool the
+      // whole credential down.
+      runtime.lastFailureKind = disposition.kind
+      const cooldown = disposition.cooldownMs
+        ?? this.defaultCooldown(disposition.kind, runtime.consecutiveFailures + 1)
+      const until = this.now() + Math.min(this.defaults.maxCooldownMs, Math.max(0, cooldown))
+      this.modelCooldownsFor(registration.id, modelId)?.set(account.id, until)
+      return disposition
+    }
     runtime.consecutiveFailures += 1
     runtime.lastFailureKind = disposition.kind
     const cooldown = disposition.cooldownMs
@@ -525,6 +648,7 @@ export class MultiProviderService {
     if (kind === 'rate-limit') return this.defaults.rateLimitCooldownMs
     if (kind === 'quota') return this.defaults.quotaCooldownMs
     if (kind === 'auth') return this.defaults.authCooldownMs
+    if (kind === 'entitlement') return this.defaults.entitlementCooldownMs
     if (kind === 'transient') {
       return this.defaults.transientBaseCooldownMs * 2 ** Math.min(10, failures - 1)
     }

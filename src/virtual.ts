@@ -170,6 +170,7 @@ function virtualStream<TApi extends Api>(
             providerId: schedulerId,
             affinityKey,
             excludeAccountIds: attempted,
+            modelId: model.id,
           })
         } catch (error) {
           if (lastTerminal !== undefined) {
@@ -257,7 +258,11 @@ function virtualStream<TApi extends Api>(
                   settled = true
                 } else {
                   const failure = failureFrom(undefined, response, outputStarted, event.error)
-                  if (!outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
+                  // A backend that is not entitled to the virtual model cannot be
+                  // fixed by retrying it, so switch backends immediately.
+                  const switchNow =
+                    service.classifyFailure(schedulerId, lease.account, failure).scope === 'model'
+                  if (!switchNow && !outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
                     sameAccountErrors += 1
                     await new Promise(resolve => { setTimeout(resolve, SAME_ACCOUNT_RETRY_DELAY_MS) })
                     if (signal.aborted) {

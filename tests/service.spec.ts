@@ -325,3 +325,153 @@ describe('MultiProviderService', () => {
     expect(service.getAffinity('example', 'session-1')).toBeUndefined()
   })
 })
+
+/**
+ * Qoder (and similar providers) answer "this account's plan does not cover this
+ * model" with a 403 long after the request started. That is not an account
+ * health problem: only the (model, account) pair is unusable, so the scheduler
+ * must skip it for that model without cooling the account down.
+ */
+describe('entitlement-aware routing', () => {
+  const pool: ProviderAccount<string>[] = [
+    { id: 'cjs', label: 'cjs', authKind: 'oauth', credentialRef: 'token-cjs' },
+    { id: 'jrj', label: 'jrj', authKind: 'oauth', credentialRef: 'token-jrj' },
+  ]
+  const ENTITLEMENT = 'Upstream status 403: {"code":"112","message":"{\\"pricingUrl\\":\\"https://qoder.com/pricing?client=qoder\\"}"}'
+  const AUTH_105 = 'Upstream status 403: {"code":"105","message":"Login expired"}'
+
+  function qoderScheduler(options: { entitlementCooldownMs?: number } = {}) {
+    let now = 1_000_000
+    const service = new MultiProviderService({ now: () => now, ...options })
+    service.registerProvider({ id: 'qoder', label: 'Qoder', accounts: () => pool })
+    return { service, advance: (ms: number) => { now += ms }, now: () => now }
+  }
+
+  async function failWith(service: MultiProviderService, modelId: string, message: string) {
+    const lease = await service.acquire<string>({ providerId: 'qoder', modelId })
+    return {
+      accountId: lease.accountId,
+      disposition: lease.release({ status: 'failure', error: { message, outputStarted: false } }),
+    }
+  }
+
+  async function accountSnapshot(service: MultiProviderService, accountId: string) {
+    const snapshot = await service.snapshot()
+    const account = snapshot.providers[0]?.accounts.find(candidate => candidate.id === accountId)
+    if (account === undefined) throw new Error(`missing account ${accountId}`)
+    return account
+  }
+
+  it('classifies the rejection as a model-scoped cooldown and keeps the account healthy', async () => {
+    const { service, now } = qoderScheduler()
+    const { accountId, disposition } = await failWith(service, 'Kimi-K3', ENTITLEMENT)
+
+    expect(accountId).toBe('cjs')
+    expect(disposition).toMatchObject({ kind: 'entitlement', retryable: true, scope: 'model' })
+
+    const account = await accountSnapshot(service, 'cjs')
+    expect(account.status).toBe('ready')
+    expect(account.cooldownUntil).toBeUndefined()
+    expect(account.consecutiveFailures).toBe(0)
+    expect(account.lastFailureKind).toBe('entitlement')
+    // The cooldown exists, but only for this model, and for the configured time.
+    expect(account.modelCooldowns).toEqual([{ modelId: 'Kimi-K3', until: now() + 30 * 60_000 }])
+  })
+
+  it('still cools an account down for a real auth failure', async () => {
+    const { service } = qoderScheduler()
+    const { disposition } = await failWith(service, 'Kimi-K3', AUTH_105)
+
+    expect(disposition).toMatchObject({ kind: 'auth', retryable: true })
+    expect((await accountSnapshot(service, 'cjs')).status).toBe('cooldown')
+  })
+
+  it('skips the marked account for that model only', async () => {
+    const { service } = qoderScheduler()
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+
+    const sameModel = await service.acquire<string>({ providerId: 'qoder', modelId: 'Kimi-K3' })
+    expect(sameModel.accountId).toBe('jrj')
+
+    // Another model is unaffected: the account is still the pool's first pick.
+    const otherModel = await service.acquire<string>({ providerId: 'qoder', modelId: 'Efficient' })
+    expect(otherModel.accountId).toBe('cjs')
+  })
+
+  it('never dead-ends when every account is marked for the model', async () => {
+    const { service } = qoderScheduler()
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+
+    const lease = await service.acquire<string>({ providerId: 'qoder', modelId: 'Kimi-K3' })
+    expect(lease.accountId).toBe('cjs')
+  })
+
+  it('lifts the model cooldown on success and when the cooldown expires', async () => {
+    const { service, advance } = qoderScheduler({ entitlementCooldownMs: 1_000 })
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+
+    // Prove the pair works again (marks are best-effort, not a blocklist).
+    const forced = await service.acquire<string>({
+      providerId: 'qoder',
+      modelId: 'Kimi-K3',
+      excludeAccountIds: ['jrj'],
+    })
+    expect(forced.accountId).toBe('cjs')
+    forced.release({ status: 'success' })
+
+    const afterSuccess = await service.acquire<string>({ providerId: 'qoder', modelId: 'Kimi-K3' })
+    expect(afterSuccess.accountId).toBe('cjs')
+
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+    advance(1_001)
+    const afterCooldown = await service.acquire<string>({ providerId: 'qoder', modelId: 'Kimi-K3' })
+    expect(afterCooldown.accountId).toBe('cjs')
+  })
+
+  it('clears model cooldowns when account health is reset', async () => {
+    const { service } = qoderScheduler()
+    await failWith(service, 'Kimi-K3', ENTITLEMENT)
+    expect((await accountSnapshot(service, 'cjs')).modelCooldowns).toHaveLength(1)
+
+    service.resetHealth('qoder', 'cjs')
+
+    expect((await accountSnapshot(service, 'cjs')).modelCooldowns).toBeUndefined()
+    const lease = await service.acquire<string>({ providerId: 'qoder', modelId: 'Kimi-K3' })
+    expect(lease.accountId).toBe('cjs')
+  })
+
+  it('keeps account-scoped and model-scoped cooldowns independent', async () => {
+    const { service, advance } = qoderScheduler()
+    // Model-scoped rejection first, while cjs is healthy...
+    await failWith(service, 'GLM-5.3', ENTITLEMENT)
+    // ...then an account-scoped quota wall for a model cjs can still take.
+    await failWith(service, 'Efficient', 'HTTP 402 quota exceeded')
+
+    const account = await accountSnapshot(service, 'cjs')
+    expect(account.status).toBe('cooldown')
+    expect(account.lastFailureKind).toBe('quota')
+    expect(account.modelCooldowns?.map(entry => entry.modelId)).toEqual(['GLM-5.3'])
+
+    // The account wall reroutes everything while it lasts.
+    expect((await service.acquire<string>({ providerId: 'qoder', modelId: 'Efficient' })).accountId).toBe('jrj')
+
+    // Once the account cooldown expires, only the model cooldown remains: cjs
+    // serves every other model again but stays out for GLM-5.3.
+    advance(15 * 60_000 + 1)
+    expect((await service.acquire<string>({ providerId: 'qoder', modelId: 'Efficient' })).accountId).toBe('cjs')
+    expect((await service.acquire<string>({ providerId: 'qoder', modelId: 'GLM-5.3' })).accountId).toBe('jrj')
+    expect((await accountSnapshot(service, 'cjs')).status).toBe('ready')
+  })
+
+  it('exposes classification for stream adapters', async () => {
+    const { service } = qoderScheduler()
+    const account = pool[0]!
+    expect(
+      service.classifyFailure('qoder', account, { message: ENTITLEMENT, outputStarted: false }),
+    ).toMatchObject({ kind: 'entitlement', scope: 'model' })
+    expect(
+      service.classifyFailure('qoder', account, { message: AUTH_105, outputStarted: false }),
+    ).toMatchObject({ kind: 'auth' })
+  })
+})

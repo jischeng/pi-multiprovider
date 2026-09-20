@@ -71,6 +71,7 @@ const ADD_SENTINEL_PREFIX = '__add__:'
 const RATE_LIMIT_OPTIONS = [15_000, 30_000, 60_000, 120_000, 300_000, 600_000]
 const QUOTA_OPTIONS = [300_000, 900_000, 1_800_000, 3_600_000, 7_200_000]
 const AUTH_OPTIONS = [60_000, 300_000, 900_000, 1_800_000]
+const ENTITLEMENT_OPTIONS = [300_000, 900_000, 1_800_000, 3_600_000, 7_200_000]
 const TRANSIENT_OPTIONS = [100, 250, 500, 1_000, 2_000, 5_000, 15_000]
 const MAX_COOLDOWN_OPTIONS = [300_000, 600_000, 1_800_000, 3_600_000, 7_200_000, 21_600_000]
 
@@ -93,8 +94,9 @@ function schedulerSummary(scheduler: SchedulerSettings): string {
   const rateLimit = scheduler.rateLimitCooldownMs ?? SCHEDULER_DEFAULTS.rateLimitCooldownMs
   const quota = scheduler.quotaCooldownMs ?? SCHEDULER_DEFAULTS.quotaCooldownMs
   const auth = scheduler.authCooldownMs ?? SCHEDULER_DEFAULTS.authCooldownMs
+  const entitlement = scheduler.entitlementCooldownMs ?? SCHEDULER_DEFAULTS.entitlementCooldownMs
   const errors = scheduler.errorsBeforeSwitch ?? SCHEDULER_DEFAULTS.errorsBeforeSwitch
-  return `${formatMs(rateLimit)} rate-limit · ${formatMs(quota)} quota · ${formatMs(auth)} auth · ${errors} errors/switch`
+  return `${formatMs(rateLimit)} rate-limit · ${formatMs(quota)} quota · ${formatMs(auth)} auth · ${formatMs(entitlement)} entitlement · ${errors} errors/switch`
 }
 
 function mergeUpstream(
@@ -366,6 +368,7 @@ function buildView(
           cooldownRow(theme, state, 'rateLimitCooldownMs', 'Rate-limit cooldown', 'Cooldown after HTTP 429 / rate-limit failures. Default 60s.', RATE_LIMIT_OPTIONS),
           cooldownRow(theme, state, 'quotaCooldownMs', 'Quota cooldown', 'Cooldown after quota or credit exhaustion (HTTP 402). Default 15m.', QUOTA_OPTIONS),
           cooldownRow(theme, state, 'authCooldownMs', 'Auth cooldown', 'Cooldown after 401/403 or invalid/expired credentials. Default 5m.', AUTH_OPTIONS),
+          cooldownRow(theme, state, 'entitlementCooldownMs', 'Entitlement cooldown', 'Cooldown for a model this account is not entitled to (plan/pricing rejection). Applied per model, so the account keeps serving its other models. Default 30m.', ENTITLEMENT_OPTIONS),
           cooldownRow(theme, state, 'transientBaseCooldownMs', 'Transient base cooldown', 'Base for exponential backoff on transient (5xx/408/425) failures; doubles per consecutive failure. Default 1s.', TRANSIENT_OPTIONS),
           cooldownRow(theme, state, 'maxCooldownMs', 'Max cooldown', 'Upper bound applied to every cooldown. Default 60m.', MAX_COOLDOWN_OPTIONS),
           countRow(theme, state, 'errorsBeforeSwitch', 'Errors before switch', 'Consecutive pre-output errors absorbed on the same account before failing over to the next account or provider. Default 3.', [1, 2, 3, 5]),

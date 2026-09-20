@@ -240,7 +240,12 @@ function liftedStream<TApi extends Api, TCredentialRef>(
                     outputStarted,
                     event.error,
                   )
-                  if (!outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
+                  // A model-scoped cooldown means this account cannot serve this
+                  // model at all, so retrying it here only burns time before the
+                  // inevitable switch.
+                  const switchNow =
+                    service.classifyFailure(provider.id, lease.account, failure).scope === 'model'
+                  if (!switchNow && !outputStarted && sameAccountErrors + 1 < errorsBeforeSwitch) {
                     sameAccountErrors += 1
                     await new Promise(resolve => { setTimeout(resolve, SAME_ACCOUNT_RETRY_DELAY_MS) })
                     if (signal.aborted) {

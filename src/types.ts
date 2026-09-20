@@ -12,7 +12,7 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent'
 
 export type AuthKind = 'api-key' | 'oauth' | 'service-account' | 'custom'
 export type SelectionPolicy = 'round-robin' | 'weighted-round-robin' | 'least-inflight' | 'priority'
-export type FailureKind = 'rate-limit' | 'quota' | 'auth' | 'transient' | 'fatal'
+export type FailureKind = 'rate-limit' | 'quota' | 'auth' | 'transient' | 'entitlement' | 'fatal'
 
 // How plain round-robin breaks ties when no session pin exists. 'first-account'
 // always starts at the first healthy account in pool order (the "main"
@@ -43,6 +43,14 @@ export interface ProviderAccount<TCredentialRef = unknown> {
 export interface FailureDisposition {
   kind: FailureKind
   retryable: boolean
+  /**
+   * What the cooldown applies to. `'account'` (default) cools the whole
+   * credential down; `'model'` cools only the (model, account) pair, which is
+   * what a plan/entitlement rejection means: the account stays usable for every
+   * model its plan does cover. Model scope needs the lease's `modelId`; a
+   * failure released without one degrades to account scope.
+   */
+  scope?: 'account' | 'model'
   cooldownMs?: number
 }
 
@@ -84,6 +92,11 @@ export interface AcquireOptions {
   providerId: string
   affinityKey?: string
   excludeAccountIds?: Iterable<string>
+  /**
+   * Model this lease is being acquired for. When set, accounts known not to be
+   * entitled to that model are skipped (see FailureKind 'entitlement').
+   */
+  modelId?: string
 }
 
 export interface LeaseOutcomeSuccess { status: 'success' }
@@ -114,6 +127,8 @@ export interface PublicAccountSnapshot {
   inFlight: number
   consecutiveFailures: number
   cooldownUntil?: number
+  /** Model-scoped cooldowns (entitlement rejections) currently in force. */
+  modelCooldowns?: ReadonlyArray<{ modelId: string; until: number }>
   lastSelectedAt?: number
   lastFailureKind?: FailureKind
   metadata: Readonly<Record<string, string | number | boolean | null>>
@@ -149,6 +164,9 @@ export interface SchedulerSettings {
   rateLimitCooldownMs?: number
   quotaCooldownMs?: number
   authCooldownMs?: number
+  // Cooldown for a model the account is not entitled to. Applied per model, so
+  // the account keeps serving the models its plan does cover.
+  entitlementCooldownMs?: number
   transientBaseCooldownMs?: number
   maxCooldownMs?: number
   // Pre-output retryable errors absorbed on the same account before the
@@ -208,6 +226,7 @@ export const SCHEDULER_SETTING_KEYS = [
   'rateLimitCooldownMs',
   'quotaCooldownMs',
   'authCooldownMs',
+  'entitlementCooldownMs',
   'transientBaseCooldownMs',
   'maxCooldownMs',
   'errorsBeforeSwitch',
@@ -219,6 +238,7 @@ export interface SchedulerOptions {
   rateLimitCooldownMs?: number
   quotaCooldownMs?: number
   authCooldownMs?: number
+  entitlementCooldownMs?: number
   transientBaseCooldownMs?: number
   maxCooldownMs?: number
   errorsBeforeSwitch?: number

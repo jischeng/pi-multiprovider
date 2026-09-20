@@ -399,3 +399,71 @@ describe('liftProvider', () => {
     expect((await service.snapshot()).providers[0]?.accounts.find(account => account.id === 'a')?.inFlight).toBe(0)
   })
 })
+
+/**
+ * An account that is not entitled to a model cannot be fixed by retrying it on
+ * the same account, so the stream must switch accounts on the first such error
+ * instead of spending the configured same-account tolerance (and its delays).
+ */
+describe('entitlement failover', () => {
+  const ENTITLEMENT = 'Upstream status 403: {"code":"112","message":"{\\"pricingUrl\\":\\"https://qoder.com/pricing?client=qoder\\"}"}'
+
+  function recordingHandler(attempted: string[]): Handler {
+    return (_requestModel, _context, options) => {
+      const account = options?.apiKey ?? 'unknown'
+      attempted.push(account)
+      const stream = createAssistantMessageEventStream()
+      void (async () => {
+        stream.push({ type: 'start', partial: message('pending') })
+        if (account === 'account-a') {
+          finishWithError(stream, ENTITLEMENT)
+          return
+        }
+        finishWithText(stream, 'rotated')
+      })()
+      return stream
+    }
+  }
+
+  it('switches accounts on the first entitlement error despite same-account tolerance', async () => {
+    const attempted: string[] = []
+    const service = new MultiProviderService({ errorsBeforeSwitch: 3 })
+    const { models, selected } = setup(recordingHandler(attempted), { service })
+
+    const stream = models.streamSimple(selected, { messages: [] })
+    const eventTypes: string[] = []
+    for await (const event of stream) eventTypes.push(event.type)
+    await stream.result()
+
+    expect(attempted).toEqual(['account-a', 'account-b'])
+    expect(eventTypes).toContain('done')
+  })
+
+  it('still absorbs tolerated errors for non-entitlement failures', async () => {
+    const attempted: string[] = []
+    const service = new MultiProviderService({ errorsBeforeSwitch: 3 })
+    const handler: Handler = (_requestModel, _context, options) => {
+      const account = options?.apiKey ?? 'unknown'
+      attempted.push(account)
+      const stream = createAssistantMessageEventStream()
+      void (async () => {
+        stream.push({ type: 'start', partial: message('pending') })
+        if (account === 'account-a') {
+          finishWithError(stream, 'HTTP 500 upstream exploded')
+          return
+        }
+        finishWithText(stream, 'rotated')
+      })()
+      return stream
+    }
+    const { models, selected } = setup(handler, { service })
+
+    const stream = models.streamSimple(selected, { messages: [] })
+    for await (const event of stream) {
+      if (event.type === 'done' || event.type === 'error') break
+    }
+    await stream.result()
+
+    expect(attempted).toEqual(['account-a', 'account-a', 'account-a', 'account-b'])
+  })
+})
