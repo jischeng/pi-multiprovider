@@ -1,6 +1,6 @@
 {
   "name": "@jischeng/pi-multiprovider",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Same-provider multi-account pooling, OAuth storage, and safe in-stream auth failover for Pi",
   "homepage": "https://github.com/jischeng/pi-multiprovider#readme",
   "repository": {
@@ -36,7 +36,9 @@
     "prepack": "bun run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
-    "check": "bun run typecheck && bun run test && bun run build"
+    "check": "bun run typecheck && bun run test && bun run build && bun run check:compat",
+    "check:compat": "node scripts/test-pi-compat.mjs",
+    "test:pi": "node scripts/test-pi-compat.mjs"
   },
   "keywords": [
     "pi-package",
@@ -65,9 +67,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
     "@types/node": "^22.20.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.9.3",
